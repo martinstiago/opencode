@@ -100,6 +100,68 @@ function executionFailed(message: string): V2Event {
   }
 }
 
+type Outcome = "succeeded" | "failed" | "interrupted"
+
+function idleMessage(outcome: Outcome = "succeeded"): SessionMessageInfo {
+  return {
+    id: "msg_idle",
+    type: "idle",
+    outcome,
+    ...(outcome === "failed" ? { error: { type: "provider.transport" as const, message: "Execution failed" } } : {}),
+    time: { created: 5 },
+  }
+}
+
+// A step that failed and was retried, followed by the step that recovered.
+function recoveredMessages(outcome: Outcome) {
+  return (messageID: string): SessionMessageInfo[] => [
+    idleMessage(outcome),
+    {
+      id: "msg_recovered",
+      type: "assistant",
+      agent: "build",
+      model: { providerID: "test", id: "test-model" },
+      content: [{ type: "text", text: "Recovered answer" }],
+      finish: "stop",
+      time: { created: 3, completed: 4 },
+    },
+    {
+      id: "msg_assistant",
+      type: "assistant",
+      agent: "build",
+      model: { providerID: "test", id: "test-model" },
+      content: [],
+      finish: "error",
+      error: { type: "provider.transport", message: "Recovered transport error" },
+      time: { created: 2, completed: 3 },
+    },
+    { id: messageID, type: "user", text: "hello", time: { created: 1 } },
+  ]
+}
+
+function retryScheduled(): V2Event {
+  return {
+    id: "evt_retry",
+    created: 3,
+    type: "session.retry.scheduled",
+    durable: { aggregateID: "ses_1", seq: 3, version: 1 },
+    data: {
+      sessionID: "ses_1",
+      assistantMessageID: "msg_assistant",
+      attempt: 1,
+      at: 2003,
+      error: { type: "provider.transport", message: "Recovered transport error" },
+    },
+  }
+}
+
+function jsonLines(stdout: string) {
+  return stdout
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+}
+
 function failedTool(inboxID: string): V2Event[] {
   return [
     prompted(inboxID),
@@ -243,6 +305,7 @@ async function run(input: {
   })()
   spyOn(sdk.event, "subscribe").mockImplementation((() => stream) as typeof sdk.event.subscribe)
   spyOn(sdk.permission, "list").mockImplementation(() => ok([]) as never)
+  spyOn(sdk.permission, "reply").mockImplementation(() => ok(undefined) as never)
   spyOn(sdk.session.form, "list").mockImplementation(
     (request) => ok(input.pendingForms?.filter((item) => item.sessionID === request.sessionID) ?? []) as never,
   )
@@ -370,6 +433,7 @@ describe("runNonInteractivePrompt", () => {
       turn: (messageID) => [prompted(messageID)],
       wait: () => idle.promise,
       messages: (messageID) => [
+        idleMessage(),
         {
           id: "msg_assistant",
           type: "assistant",
@@ -405,6 +469,7 @@ describe("runNonInteractivePrompt", () => {
   test("reports usage for a step that ends after the Session goes idle", async () => {
     const tokens = { input: 3, output: 5, reasoning: 7, cache: { read: 11, write: 13 } }
     const assistant = (messageID: string): SessionMessageInfo[] => [
+      idleMessage(),
       {
         id: "msg_assistant",
         type: "assistant",
@@ -481,6 +546,136 @@ describe("runNonInteractivePrompt", () => {
       expect(output.exitCode).toBe(1)
       expect(output.stdout).toContain("selection unavailable")
     }
+  })
+
+  test("a recovered step failure and its retry exit 0 and still wait for background work", async () => {
+    const lists: ExperimentalJobListOutput[] = [[shellJob("sh_train", "python train.py")], []]
+    const output = await capture({
+      format: "json",
+      jobs: () => lists.shift() ?? [],
+      messages: recoveredMessages("succeeded"),
+      turn: (id) => [
+        prompted(id),
+        stepStarted(),
+        stepFailed("Recovered transport error"),
+        retryScheduled(),
+        settled(),
+        {
+          id: "evt_text",
+          created: 2,
+          type: "session.text.ended",
+          durable: { aggregateID: "ses_1", seq: 2, version: 1 },
+          data: { sessionID: "ses_1", assistantMessageID: "msg_2", ordinal: 0, text: "Training finished." },
+        },
+        settled(),
+      ],
+    })
+    const events = jsonLines(output.stdout)
+    expect(output.exitCode).toBe(0)
+    expect(events.filter((event) => event.type === "error")).toEqual([])
+    expect(events.find((event) => event.type === "retry")).toEqual({
+      type: "retry",
+      timestamp: 3,
+      sessionID: "ses_1",
+      messageID: "msg_assistant",
+      attempt: 1,
+      nextRetryAt: 2003,
+      error: { type: "provider.transport", message: "Recovered transport error" },
+    })
+    expect(output.stdout).toContain("Training finished.")
+    expect(lists).toEqual([])
+  })
+
+  test("prints a retry line in text output", async () => {
+    const output = await capture({
+      turn: (id) => [prompted(id), stepStarted(), retryScheduled(), settled()],
+      messages: recoveredMessages("succeeded"),
+    })
+    expect(output.exitCode).toBe(0)
+    expect(output.stderr).toContain("retrying (attempt 1): Recovered transport error")
+    expect(output.stderr).not.toContain("Error:")
+  })
+
+  test("V1 compatibility does not report retries", async () => {
+    const output = await capture({
+      compatibility: "v1",
+      format: "json",
+      turn: (id) => [prompted(id), retryScheduled(), settled()],
+    })
+    expect(output).toEqual({ stdout: "", stderr: "", exitCode: 0 })
+  })
+
+  for (const live of [true, false]) {
+    test(`a final failure exits 1 with one error (${live ? "live event" : "live event dropped"})`, async () => {
+      const output = await capture({
+        format: "json",
+        turn: (messageID) => [
+          prompted(messageID),
+          stepFailed("Recovered transport error"),
+          ...(live ? [executionFailed("Execution failed")] : []),
+        ],
+        messages: recoveredMessages("failed"),
+        ...(live ? {} : { wait: () => Promise.resolve() }),
+      })
+      expect(output.exitCode).toBe(1)
+      expect(jsonLines(output.stdout).filter((event) => event.type === "error")).toEqual([
+        expect.objectContaining({ error: expect.objectContaining({ message: "Execution failed" }) }),
+      ])
+    })
+
+    test(`an interruption from elsewhere exits 1 with one error (${live ? "live event" : "live event dropped"})`, async () => {
+      const output = await capture({
+        format: "json",
+        turn: (messageID) => [prompted(messageID), ...(live ? [settled("interrupted")] : [])],
+        messages: recoveredMessages("interrupted"),
+        ...(live ? {} : { wait: () => Promise.resolve() }),
+      })
+      expect(output.exitCode).toBe(1)
+      expect(jsonLines(output.stdout).filter((event) => event.type === "error")).toEqual([
+        expect.objectContaining({ error: { type: "aborted", message: "Session interrupted" } }),
+      ])
+    })
+  }
+
+  test("Ctrl-C exits 130 without reporting the interrupted outcome", async () => {
+    const idle = Promise.withResolvers<void>()
+    const running = capture({
+      format: "json",
+      turn: (id) => [prompted(id)],
+      wait: () => idle.promise,
+      messages: recoveredMessages("interrupted"),
+    })
+    await Bun.sleep(5)
+    process.emit("SIGINT")
+    idle.resolve()
+    const output = await running
+    expect(output.exitCode).toBe(130)
+    expect(output.stdout).not.toContain('"type":"error"')
+  })
+
+  test("a rejected permission continues and a cancelled form exits 1 without another error", async () => {
+    const permission: V2Event = {
+      id: "evt_permission",
+      created: 2,
+      type: "permission.asked",
+      data: { id: "per_1", sessionID: "ses_1", action: "shell", resources: ["rm -rf build"] },
+    }
+    const rejected = await capture({
+      format: "json",
+      turn: (id) => [prompted(id), permission, settled()],
+      messages: recoveredMessages("succeeded"),
+    })
+    expect(rejected.exitCode).toBe(0)
+    expect(rejected.stderr).toContain("auto-rejecting")
+    expect(rejected.stdout).not.toContain('"type":"error"')
+
+    const cancelled = await capture({
+      format: "json",
+      turn: (id) => [prompted(id), formCreated(form("frm_live", "ses_1")), settled("interrupted")],
+      messages: recoveredMessages("interrupted"),
+    })
+    expect(cancelled.exitCode).toBe(1)
+    expect(cancelled.stdout).not.toContain('"type":"error"')
   })
 
   test("cancels session and global form blockers and exits on pre-promotion interrupt", async () => {

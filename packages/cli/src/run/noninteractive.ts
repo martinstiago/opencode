@@ -4,6 +4,7 @@ import type {
   LocationRef,
   OpenCodeClient,
   SessionMessageAssistantTool,
+  SessionMessageIdle,
   SessionMessageInfo,
   ToolContent,
 } from "@opencode/client/promise"
@@ -95,7 +96,8 @@ export async function runNonInteractivePrompt(input: Input) {
   let formCancelled = false
   let interrupted = false
   let v1InvalidOutput = false
-  let prePromotionError: { message: string; [key: string]: unknown } | undefined
+  // The live terminal event, used when no idle marker can decide the outcome.
+  let ended: Pick<SessionMessageIdle, "outcome" | "error"> | undefined
   let finalizing = false
   let admission: AbortController | undefined
   let pendingStep: { timestamp: number; part: Record<string, unknown>; label: string } | undefined
@@ -164,7 +166,7 @@ export async function runNonInteractivePrompt(input: Input) {
 
   // Any job in the tree holds the run open: this session's, its subagents', and theirs.
   const pendingBackground = async () => {
-    if (input.compatibility === "v1" || interrupted || permissionRejected || formCancelled || emittedError) return false
+    if (input.compatibility === "v1" || interrupted || formCancelled) return false
     const jobs = await input.client.experimental.job
       .list({ sessionID: input.sessionID, descendants: true })
       .catch(() => [])
@@ -287,7 +289,7 @@ export async function runNonInteractivePrompt(input: Input) {
       if (event.type === "session.inbox.delivered") {
         if (event.data.inboxID === messageID) {
           promoted = true
-          prePromotionError = undefined
+          ended = undefined
           continue
         }
       }
@@ -299,7 +301,7 @@ export async function runNonInteractivePrompt(input: Input) {
         return
       }
       if (!promoted && event.type === "session.execution.failed") {
-        prePromotionError = event.data.error
+        ended = { outcome: "failed", error: event.data.error }
         if (finalizing) return
         continue
       }
@@ -562,15 +564,35 @@ export async function runNonInteractivePrompt(input: Input) {
           v1InvalidOutput = true
           continue
         }
-        if (interrupted || permissionRejected || formCancelled) continue
+        // The runner may recover from a failed step; only the execution's outcome decides failure.
+        if (input.compatibility !== "v1" || interrupted || permissionRejected || formCancelled) continue
         flushStep()
         emittedError = true
         process.exitCode = 1
         if (!emit("error", time, { error: event.data.error })) UI.error(event.data.error.message)
         continue
       }
+      // V1 compatibility mirrors the frozen V1 output, which never reported retries.
+      if (event.type === "session.retry.scheduled" && input.compatibility !== "v1") {
+        const retry = {
+          messageID: event.data.assistantMessageID,
+          attempt: event.data.attempt,
+          nextRetryAt: event.data.at,
+          error: event.data.error,
+        }
+        if (!emit("retry", time, retry))
+          UI.println(
+            UI.Style.TEXT_WARNING_BOLD + "!",
+            UI.Style.TEXT_NORMAL + `retrying (attempt ${retry.attempt}): ${retry.error.message}`,
+          )
+        continue
+      }
+
+      // Outside V1 compatibility, the outcome is decided once the Session is idle.
       if (event.type === "session.execution.failed") {
-        if (input.compatibility === "v1" && (v1InvalidOutput || permissionRejected || formCancelled)) return
+        ended = { outcome: "failed", error: event.data.error }
+        if (input.compatibility !== "v1") return
+        if (v1InvalidOutput || permissionRejected || formCancelled) return
         flushStep()
         if (!emittedError && !formCancelled) {
           emittedError = true
@@ -580,18 +602,21 @@ export async function runNonInteractivePrompt(input: Input) {
         return
       }
       if (event.type === "session.execution.interrupted") {
-        if (input.compatibility === "v1" && (permissionRejected || formCancelled)) return
+        const error = { type: "aborted", message: `Session interrupted: ${event.data.reason}` }
+        ended = { outcome: "interrupted", error }
+        if (input.compatibility !== "v1") return
+        if (permissionRejected || formCancelled) return
         if (event.data.reason === "user" && interrupted) process.exitCode = 130
         // A declined tool call ends the step with an interruption; it was already reported above.
         if (event.data.reason !== "user" && !emittedError && !permissionRejected && !formCancelled) {
           emittedError = true
           process.exitCode = 1
-          const error = { type: "aborted" as const, message: `Session interrupted: ${event.data.reason}` }
           if (!emit("error", time, { error })) UI.error(error.message)
         }
         return
       }
       if (event.type === "session.execution.succeeded") {
+        ended = { outcome: "succeeded" }
         waitingForBackground = await pendingBackground()
         if (waitingForBackground) continue
         return
@@ -740,18 +765,10 @@ export async function runNonInteractivePrompt(input: Input) {
           },
         })
       }
-
-      // A declined tool call ends its step with an interrupted-step error that is
-      // only a consequence of our own rejection; it was already reported above.
-      if (message.error && !emittedError && !permissionRejected && !formCancelled) {
-        emittedError = true
-        process.exitCode = 1
-        if (!emit("error", timestamp, { error: message.error })) UI.error(message.error.message)
-      }
     }
     return {
       found: projected.found,
-      responded: projected.messages.some((message) => message.type === "assistant"),
+      idle: projected.messages.findLast((message) => message.type === "idle"),
     }
   }
 
@@ -850,30 +867,27 @@ export async function runNonInteractivePrompt(input: Input) {
       await input.client.experimental.session.wait({ sessionID: input.sessionID })
       if (!(await pendingBackground())) return
       await completed
-      if (!interrupted && !permissionRejected && !formCancelled && !emittedError) {
-        await input.client.experimental.session.wait({ sessionID: input.sessionID })
-      }
+      if (!interrupted && !formCancelled) await input.client.experimental.session.wait({ sessionID: input.sessionID })
     }
     const waiting = waitUntilIdle()
     await Promise.race([waiting, completed.then(() => waiting)])
     finalizing = true
     const projected = await reconcile()
-    if (
-      !projected.responded &&
-      !interrupted &&
-      !permissionRejected &&
-      !formCancelled &&
-      !emittedError &&
-      !prePromotionError
-    ) {
-      await completed
-    }
-    if (!projected.found && !interrupted && !permissionRejected && !formCancelled && !emittedError) {
-      const error = prePromotionError ?? { type: "unknown", message: "Prompt was not promoted" }
-      emittedError = true
-      process.exitCode = 1
-      if (!emit("error", Date.now(), { error })) UI.error(error.message)
-    }
+    // Ctrl+C already chose exit code 130, and a cancelled form chose 1 and was reported.
+    if (interrupted || formCancelled) return
+    // The idle marker decides the outcome. A prompt that was never promoted, or a shutdown, records none.
+    if (!projected.idle && !ended) await completed
+    const final = projected.found
+      ? (projected.idle ?? ended)
+      : { outcome: "failed" as const, error: ended?.error ?? { type: "unknown", message: "Prompt was not promoted" } }
+    if (!final || final.outcome === "succeeded") return
+    const error =
+      final.error ??
+      (final.outcome === "failed"
+        ? { type: "unknown", message: "Session failed" }
+        : { type: "aborted", message: "Session interrupted" })
+    process.exitCode = 1
+    if (!emit("error", projected.idle?.time.created ?? Date.now(), { error })) UI.error(error.message)
   } finally {
     process.off("SIGINT", interrupt)
     controller.abort()
