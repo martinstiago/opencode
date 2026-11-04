@@ -71,6 +71,9 @@ const GLOBAL_FORM_SESSION_ID = "global"
 const QUESTION_CANCELLED_FEEDBACK =
   "This non-interactive run cannot ask the user questions, so the question was cancelled. Continue without an answer; make reasonable assumptions and state them."
 
+// A live terminal event normally arrives within milliseconds of session.wait returning.
+const LIVE_TERMINAL_GRACE_MS = 1000
+
 const PERMISSION_REJECTED_FEEDBACK =
   "This non-interactive run cannot ask the user for permission, so the request was rejected. Continue without this action."
 
@@ -96,8 +99,11 @@ export async function runNonInteractivePrompt(input: Input) {
   let formCancelled = false
   let interrupted = false
   let v1InvalidOutput = false
-  // The live terminal event, used when no idle marker can decide the outcome.
-  let ended: Pick<SessionMessageIdle, "outcome" | "error"> | undefined
+  let prePromotionError: SessionMessageIdle["error"]
+  // Live terminal events by the ID of the idle marker each one projects, for when a marker is missing.
+  const terminals = new Map<string, Pick<SessionMessageIdle, "outcome" | "error">>()
+  // Set once the run has waited for background work, whose follow-up replies then count toward the outcome.
+  let backgroundSeen = false
   let finalizing = false
   let admission: AbortController | undefined
   let pendingStep: { timestamp: number; part: Record<string, unknown>; label: string } | undefined
@@ -174,16 +180,16 @@ export async function runNonInteractivePrompt(input: Input) {
       jobSessions.add(job.sessionID)
       if (job.kind === "subagent") jobSessions.add(job.childSessionID)
     })
-    if (jobs.length > 0) return true
+    if (jobs.length > 0) return (backgroundSeen = true)
     // A finished job wakes its session before its row is removed, so a wake that raced the
     // list above shows up as a queued inbox item or an active session in the tree.
     const [active, inboxes] = await Promise.all([
       input.client.session.active().catch(() => ({})),
       Promise.all([...jobSessions].map((sessionID) => input.client.session.inbox.list({ sessionID }).catch(() => []))),
     ])
-    if (inboxes.some((inbox) => inbox.length > 0)) return true
+    if (inboxes.some((inbox) => inbox.length > 0)) return (backgroundSeen = true)
     for (const sessionID of Object.keys(active)) {
-      if (await ownsSession(sessionID)) return true
+      if (await ownsSession(sessionID)) return (backgroundSeen = true)
     }
     return false
   }
@@ -289,7 +295,7 @@ export async function runNonInteractivePrompt(input: Input) {
       if (event.type === "session.inbox.delivered") {
         if (event.data.inboxID === messageID) {
           promoted = true
-          ended = undefined
+          prePromotionError = undefined
           continue
         }
       }
@@ -301,7 +307,7 @@ export async function runNonInteractivePrompt(input: Input) {
         return
       }
       if (!promoted && event.type === "session.execution.failed") {
-        ended = { outcome: "failed", error: event.data.error }
+        prePromotionError = event.data.error
         if (finalizing) return
         continue
       }
@@ -590,7 +596,7 @@ export async function runNonInteractivePrompt(input: Input) {
 
       // Outside V1 compatibility, the outcome is decided once the Session is idle.
       if (event.type === "session.execution.failed") {
-        ended = { outcome: "failed", error: event.data.error }
+        terminals.set(SessionMessage.ID.fromEvent(event.id), { outcome: "failed", error: event.data.error })
         if (input.compatibility !== "v1") return
         if (v1InvalidOutput || permissionRejected || formCancelled) return
         flushStep()
@@ -603,7 +609,7 @@ export async function runNonInteractivePrompt(input: Input) {
       }
       if (event.type === "session.execution.interrupted") {
         const error = { type: "aborted", message: `Session interrupted: ${event.data.reason}` }
-        ended = { outcome: "interrupted", error }
+        terminals.set(SessionMessage.ID.fromEvent(event.id), { outcome: "interrupted", error })
         if (input.compatibility !== "v1") return
         if (permissionRejected || formCancelled) return
         if (event.data.reason === "user" && interrupted) process.exitCode = 130
@@ -616,7 +622,7 @@ export async function runNonInteractivePrompt(input: Input) {
         return
       }
       if (event.type === "session.execution.succeeded") {
-        ended = { outcome: "succeeded" }
+        terminals.set(SessionMessage.ID.fromEvent(event.id), { outcome: "succeeded" })
         waitingForBackground = await pendingBackground()
         if (waitingForBackground) continue
         return
@@ -768,7 +774,7 @@ export async function runNonInteractivePrompt(input: Input) {
     }
     return {
       found: projected.found,
-      idle: projected.messages.findLast((message) => message.type === "idle"),
+      idles: projected.messages.filter((message) => message.type === "idle"),
     }
   }
 
@@ -866,6 +872,8 @@ export async function runNonInteractivePrompt(input: Input) {
     const waitUntilIdle = async () => {
       await input.client.experimental.session.wait({ sessionID: input.sessionID })
       if (!(await pendingBackground())) return
+      // A prompt that failed before promotion stays in the inbox, which looks like pending work.
+      if (!promoted && !(await projectedMessages()).found) return
       await completed
       if (!interrupted && !formCancelled) await input.client.experimental.session.wait({ sessionID: input.sessionID })
     }
@@ -873,27 +881,53 @@ export async function runNonInteractivePrompt(input: Input) {
     await Promise.race([waiting, completed.then(() => waiting)])
     finalizing = true
     const projected = await reconcile()
+    // Idle markers are stored before wait returns, but a live terminal event covering a missing one may be in flight.
+    const observed = projected.found ? projected.idles.length > 0 || terminals.size > 0 : !!prePromotionError
+    if (!observed && !interrupted && !formCancelled)
+      await Promise.race([completed, new Promise((resolve) => setTimeout(resolve, LIVE_TERMINAL_GRACE_MS).unref())])
     // Ctrl+C already chose exit code 130, and a cancelled form chose 1 and was reported.
     if (interrupted || formCancelled) return
-    // The idle marker decides the outcome. A prompt that was never promoted, or a shutdown, records none.
-    if (!projected.idle && !ended) await completed
-    const final = projected.found
-      ? (projected.idle ?? ended)
-      : { outcome: "failed" as const, error: ended?.error ?? { type: "unknown", message: "Prompt was not promoted" } }
-    if (!final || final.outcome === "succeeded") return
-    const error =
-      final.error ??
-      (final.outcome === "failed"
-        ? { type: "unknown", message: "Session failed" }
-        : { type: "aborted", message: "Session interrupted" })
+    const error = runError({
+      found: projected.found,
+      idles: projected.idles,
+      terminals,
+      backgroundSeen,
+      prePromotionError,
+    })
+    if (!error) return
     process.exitCode = 1
-    if (!emit("error", projected.idle?.time.created ?? Date.now(), { error })) UI.error(error.message)
+    if (!emit("error", Date.now(), { error })) UI.error(error.message)
   } finally {
     process.off("SIGINT", interrupt)
     controller.abort()
     if (input.compatibility === "v1") await stream.return?.(undefined).catch(() => {})
     else void stream.return?.(undefined).catch(() => {})
   }
+}
+
+function runError(input: {
+  found: boolean
+  idles: SessionMessageIdle[]
+  terminals: Map<string, Pick<SessionMessageIdle, "outcome" | "error">>
+  backgroundSeen: boolean
+  prePromotionError: SessionMessageIdle["error"]
+}) {
+  if (!input.found) return input.prePromotionError ?? { type: "unknown", message: "Prompt was not promoted" }
+  // The first idle marker after the prompt closes its turn. Later ones count only as background follow-ups;
+  // otherwise they belong to other prompts, possibly from another client.
+  const recorded =
+    input.idles.length > 0 ? input.idles : [...input.terminals].map(([id, terminal]) => ({ id, ...terminal }))
+  const turns = input.backgroundSeen ? recorded : recorded.slice(0, 1)
+  const final = turns.find((turn) => turn.outcome !== "succeeded") ?? turns[0]
+  if (!final) return { type: "unknown", message: "Session ended without a recorded outcome" }
+  if (final.outcome === "succeeded") return
+  return (
+    final.error ??
+    input.terminals.get(final.id)?.error ??
+    (final.outcome === "failed"
+      ? { type: "unknown", message: "Session failed" }
+      : { type: "aborted", message: "Session interrupted" })
+  )
 }
 
 function sameLocation(left: LocationRef | undefined, right: LocationRef) {

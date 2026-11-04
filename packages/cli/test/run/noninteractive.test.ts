@@ -102,14 +102,18 @@ function executionFailed(message: string): V2Event {
 
 type Outcome = "succeeded" | "failed" | "interrupted"
 
-function idleMessage(outcome: Outcome = "succeeded"): SessionMessageInfo {
+// Idle markers take their ID from the terminal event that projects them.
+function idleMessage(
+  outcome: Outcome = "succeeded",
+  id = `msg_${outcome === "failed" ? "execution_failed" : outcome}`,
+) {
   return {
-    id: "msg_idle",
+    id,
     type: "idle",
     outcome,
     ...(outcome === "failed" ? { error: { type: "provider.transport" as const, message: "Execution failed" } } : {}),
     time: { created: 5 },
-  }
+  } satisfies SessionMessageInfo
 }
 
 // A step that failed and was retried, followed by the step that recovered.
@@ -281,6 +285,7 @@ async function run(input: {
   messages?: (inboxID: string) => SessionMessageInfo[]
   wait?: () => Promise<void>
   jobs?: () => ExperimentalJobListOutput
+  inbox?: (sessionID: string) => unknown[]
   terminalDelay?: number
 }) {
   const sdk = OpenCode.make({ baseUrl: "https://opencode.test" })
@@ -321,7 +326,7 @@ async function run(input: {
   spyOn(sdk.experimental.session, "wait").mockImplementation(() => input.wait?.() ?? wait.promise)
   spyOn(sdk.experimental.job, "list").mockImplementation(() => ok(input.jobs?.() ?? []) as never)
   spyOn(sdk.session, "active").mockImplementation(() => ok({}) as never)
-  spyOn(sdk.session.inbox, "list").mockImplementation(() => ok([]) as never)
+  spyOn(sdk.session.inbox, "list").mockImplementation(({ sessionID }) => ok(input.inbox?.(sessionID) ?? []) as never)
   spyOn(sdk.session, "get").mockImplementation(
     ({ sessionID }) => ok({ id: sessionID, parentID: sessionID === "ses_child" ? "ses_1" : undefined }) as never,
   )
@@ -632,10 +637,77 @@ describe("runNonInteractivePrompt", () => {
       })
       expect(output.exitCode).toBe(1)
       expect(jsonLines(output.stdout).filter((event) => event.type === "error")).toEqual([
-        expect.objectContaining({ error: { type: "aborted", message: "Session interrupted" } }),
+        expect.objectContaining({
+          error: { type: "aborted", message: live ? "Session interrupted: user" : "Session interrupted" },
+        }),
       ])
     })
   }
+
+  test("only the first idle marker after the prompt decides the outcome", async () => {
+    const output = await capture({
+      format: "json",
+      turn: (id) => [prompted(id)],
+      wait: () => Promise.resolve(),
+      messages: (messageID) => [
+        idleMessage("failed", "msg_later_idle"),
+        { id: "msg_other_prompt", type: "user", text: "another client", time: { created: 6 } },
+        ...recoveredMessages("succeeded")(messageID),
+        idleMessage("failed", "msg_previous_idle"),
+      ],
+    })
+    expect(output.exitCode).toBe(0)
+    expect(output.stdout).not.toContain('"type":"error"')
+  })
+
+  test("a failed reply to finished background work exits 1", async () => {
+    const lists: ExperimentalJobListOutput[] = [[shellJob("sh_train", "python train.py")], []]
+    const output = await capture({
+      format: "json",
+      jobs: () => lists.shift() ?? [],
+      turn: (id) => [prompted(id), settled(), executionFailed("Execution failed")],
+      messages: (messageID) => [
+        idleMessage("failed"),
+        { id: "msg_notice", type: "synthetic", text: "<shell>done</shell>", time: { created: 6 } },
+        ...recoveredMessages("succeeded")(messageID),
+      ],
+    })
+    expect(output.exitCode).toBe(1)
+    expect(jsonLines(output.stdout).filter((event) => event.type === "error")).toEqual([
+      expect.objectContaining({ error: expect.objectContaining({ message: "Execution failed" }) }),
+    ])
+  })
+
+  test("a prompt left in the inbox by a failure before promotion does not hang", async () => {
+    const output = await capture({
+      format: "json",
+      turn: () => [executionFailed("instructions unavailable")],
+      messages: () => [],
+      inbox: (sessionID) => (sessionID === "ses_1" ? [{ id: "msg_prompt" }] : []),
+    })
+    expect(output.exitCode).toBe(1)
+    expect(jsonLines(output.stdout)).toEqual([
+      expect.objectContaining({
+        type: "error",
+        error: expect.objectContaining({ message: "instructions unavailable" }),
+      }),
+    ])
+  })
+
+  test("exits 1 when neither an idle marker nor a live terminal event records the outcome", async () => {
+    const output = await capture({
+      format: "json",
+      turn: (id) => [prompted(id)],
+      wait: () => Promise.resolve(),
+      messages: (messageID) => recoveredMessages("succeeded")(messageID).slice(1),
+    })
+    expect(output.exitCode).toBe(1)
+    expect(jsonLines(output.stdout).filter((event) => event.type === "error")).toEqual([
+      expect.objectContaining({
+        error: expect.objectContaining({ message: "Session ended without a recorded outcome" }),
+      }),
+    ])
+  })
 
   test("Ctrl-C exits 130 without reporting the interrupted outcome", async () => {
     const idle = Promise.withResolvers<void>()
