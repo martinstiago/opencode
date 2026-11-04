@@ -711,13 +711,18 @@ describe("runNonInteractivePrompt", () => {
 
   test("Ctrl-C exits 130 without reporting the interrupted outcome", async () => {
     const idle = Promise.withResolvers<void>()
+    const waiting = Promise.withResolvers<void>()
     const running = capture({
       format: "json",
       turn: (id) => [prompted(id)],
-      wait: () => idle.promise,
+      wait: () => {
+        waiting.resolve()
+        return idle.promise
+      },
       messages: recoveredMessages("interrupted"),
     })
-    await Bun.sleep(5)
+    // The prompt was admitted once the run waits for the Session.
+    await waiting.promise
     process.emit("SIGINT")
     idle.resolve()
     const output = await running
